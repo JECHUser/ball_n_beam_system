@@ -1,34 +1,119 @@
 
+//*****************************************************************************
+//
+//! main.c - Programación principal para la programación de la MPU6050 (aceleró-
+//! metro y giroscopio. El programa permite obtener los valores de aceleración
+//! y giroscopio que entrega la MPU6050 y cáclula los ángulos roll y pitch.
+//!
+//! Se configura el PID que controla el equilibrio del balancín y se incluye la
+//! comunicación UART para el envío de datos hacia la PC (MATLAB).
+//!
+//! Basado en los ejemplos Programming Example from TivaWare Sensor Library User's
+//! Guide. That shows how to initialize the MPU6050.
+//
+//*****************************************************************************
 
-/**
- * main.c
- */
+//*****************************************************************************
+//
+// MPU6050 - Example shows how to initialize the MPU6050,  select the +/- 4 g
+//           range for the accelerometer, and read acceleration and rotation data
+//           from it.
+//
+// Copyright (c) 2010-2017 Texas Instruments Incorporated.  All rights reserved.
+// Software License Agreement
+//
+//   Redistribution and use in source and binary forms, with or without
+//   modification, are permitted provided that the following conditions
+//   are met:
+//
+//   Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+//
+//   Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the
+//   distribution.
+//
+//   Neither the name of Texas Instruments Incorporated nor the names of
+//   its contributors may be used to endorse or promote products derived
+//   from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// This is part of revision 2.1.4.178 of the Tiva Firmware Development Package.
+//
+//*****************************************************************************
 
-
-
-
+//
+// General functions
+//
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include "inc/hw_ints.h"
 #include "inc/hw_memmap.h"
+#include "inc/hw_sysctl.h"
 #include "inc/hw_types.h"
-#include "driverlib/adc.h"
-#include "driverlib/debug.h"
-#include "driverlib/fpu.h"
+#include "inc/hw_types.h"
+#include "inc/hw_gpio.h"
 #include "driverlib/gpio.h"
-#include "driverlib/interrupt.h"
 #include "driverlib/pin_map.h"
-#include "driverlib/ssi.h"
 #include "driverlib/rom.h"
+#include "driverlib/rom_map.h"
+#include "driverlib/debug.h"
+#include "driverlib/interrupt.h"
 #include "driverlib/sysctl.h"
 #include "driverlib/timer.h"
-#include "driverlib/uart.h"
-#include "utils/uartstdio.h"
+#include "driverlib/ssi.h"
+
+//
+// I2C and MPU6050 libraries
+//
+#include "inc/hw_i2c.h"
+#include "driverlib/i2c.h"
 #include "sensorlib/i2cm_drv.h"
-#include "sensorlib/i2cm_drv.c"
 #include "sensorlib/hw_mpu6050.h"
 #include "sensorlib/mpu6050.h"
-#include "sensorlib/mpu6050.c"
+
+//
+// Mathematics functions
+//
+#include <math.h>
+
+//
+// UART functions
+//
+#include "utils/uartstdio.h"
+#include "driverlib/uart.h"
+
+//*****************************************************************************
+//
+//! The states of the MPU6050 state machine.
+//
+//*****************************************************************************
+//
+// A boolean that is set when a MPU6050 command has completed.
+//
+volatile bool g_bMPU6050Done;
+
+//
+// I2C master instance
+//
+tI2CMInstance g_sI2CMSimpleInst;
+float roll = 0, pitch = 0;
 
 //*****************************************************************************
 // Definiciones para configuración del SPI
@@ -43,86 +128,169 @@
 uint16_t dato;
 uint16_t data_out;
 uint32_t pui32DataTx[NUM_SPI_DATA];
+uint32_t pui32residual[NUM_SPI_DATA];
+uint16_t freq_muestreo = 1000;
 
 //*****************************************************************************
 // Variables para Controlador PID
 //*****************************************************************************
-uint16_t temp1 = 0, temp2 = 0;
-uint32_t pui32ADC0Value[2];     // Spaces for processed data
-float accelerometer_reading[3], gyro_reading[3];
+uint8_t ui32Index;
+float u_k_temp = 0;
 
+//*****************************************************************************
+//
+// The interrupt handler for the first timer interrupt.
+//
+//*****************************************************************************
 void
 Timer0IntHandler(void)
 {
-
     // Clear the timer interrupt.
     TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
 
-    // Trigger the ADC conversion.
-    ADCProcessorTrigger(ADC0_BASE, 2);
+    // PID Controller
 
-    // Wait for conversion to be completed.
-    while(!ADCIntStatus(ADC0_BASE, 2, false))
+    float e_k_1 = 0;
+    float E_k = 0;
+
+    float kP = 2;
+    float kI = 0;
+    float kD = 0;
+
+    float e_k = 0 - (float) pitch;
+    float eD = e_k - e_k_1;
+    float E_K = E_k + e_k;
+    float u_k = kP*e_k + kI*E_k + kD*eD;
+    e_k_1 = e_k;
+
+    // Limites para los resultados obtenidos
+
+    if (u_k_temp > 3.3)
     {
+        u_k = 3.3;
+    }
+    if (u_k_temp < 0.1)
+    {
+        u_k = 0.1;
     }
 
-    // Clear the ADC interrupt flag.
-    ADCIntClear(ADC0_BASE, 2);
+    u_k = u_k_temp*4095/3.3;
 
-    // Data Acquisition
-    ADCSequenceDataGet(ADC0_BASE, 2, pui32ADC0Value);
+    data_out = u_k;
 
-    temp1 = (uint32_t)pui32ADC0Value[0];
-    temp2 = (uint32_t)pui32ADC0Value[1];
+    // bits de configuración
+    dato = 0b0111000000000000;
+    dato |= data_out;
 
+    pui32DataTx[0] = (uint32_t)(dato);
+
+    for(ui32Index = 0; ui32Index < NUM_SPI_DATA; ui32Index++)
+    {
+        SSIDataPut(SSI0_BASE, pui32DataTx[ui32Index]);
+    }
+
+    while(SSIBusy(SSI0_BASE))
+    {
+    }
 }
 
-void
+//*****************************************************************************
+//
+//! Initialize UART0 Communication.
+//!
+//! The following UART signals are configured only for displaying console
+//! messages for this example.
+//! - UART0 peripheral
+//! - GPIO Port A peripheral (for UART0 pins)
+//! - UART0RX - PA0
+//! - UART0TX - PA1
+//!
+//! \return Returns 1 if the MPU6050 driver was successfully initialized and 0
+//! if it was not.
+//
+//*****************************************************************************
+inline void
 InitConsole(void)
 {
+    //
     // Enable GPIO port A which is used for UART0 pins.
-    // TODO: change this to whichever GPIO port you are using.
+    //
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOA));
 
+    //
+    // Enable UART0 so that we can configure the clock.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+
+    //
     // Configure the pin muxing for UART0 functions on port A0 and A1.
-    // This step is not necessary if your part does not support pin muxing.
-    // TODO: change this to select the port/pin you are using.
+    //
     GPIOPinConfigure(GPIO_PA0_U0RX);
     GPIOPinConfigure(GPIO_PA1_U0TX);
 
-    // Enable UART0 so that we can configure the clock.
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
-
-    // Use the internal 16MHz oscillator as the UART clock source.
-    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
-
+    //
     // Select the alternate (UART) function for these pins.
     // TODO: change this to select the port/pin you are using.
+    //
     GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
 
+    //
+    // Use the internal 16MHz oscillator as the UART clock source.
+    //
+    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
+
+    //
     // Initialize the UART for console I/O.
+    //
     UARTStdioConfig(0, 115200, 16000000);
 }
 
-int
-main(void)
+//*****************************************************************************
+//
+//! Initializes the I2C Communication.
+//
+//*****************************************************************************
+void
+InitI2C0(void)
 {
-    uint32_t pui32residual[NUM_SPI_DATA];
-    uint16_t freq_muestreo = 1000;   // En Hz
+    //
+    // Reset & Enable GPIO port B which is used for I2C0 pins.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
+    SysCtlPeripheralReset(SYSCTL_PERIPH_I2C0);
 
-    // Set the clocking to run at 80 MHz (200 MHz / 2.5) using the PLL.  When
-    // using the ADC, you must either use the PLL or supply a 16 MHz clock source.
-    // TODO: The SYSCTL_XTAL_ value must be changed to match the value of the
-    // crystal on your board.
-    //SysCtlClockSet(SYSCTL_SYSDIV_10 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN |
-    //                 SYSCTL_XTAL_16MHZ); // 20 MHz
-    SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN |
-                   SYSCTL_XTAL_16MHZ); // 80 MHz
+    //
+    // Enable GPIO peripheral that contains I2C0
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
 
-    // Set up the serial console to use for displaying messages.  This is
-    // just for this example program and is not needed for ADC operation.
-    InitConsole();
+    //
+    // Configure PB2 to SCL and PB3 SDA. Select the I2C function for
+    // these pins.
+    //
+    GPIOPinConfigure(GPIO_PB2_I2C0SCL);
+    GPIOPinConfigure(GPIO_PB3_I2C0SDA);
+    GPIOPinTypeI2CSCL(GPIO_PORTB_BASE, GPIO_PIN_2);
+    GPIOPinTypeI2C(GPIO_PORTB_BASE, GPIO_PIN_3);
 
+    //
+    // Initialize I2C Master with 100kbps (if true would be 400kbps)
+    //
+    I2CMasterInitExpClk(I2C0_BASE, SysCtlClockGet(), true);
+
+    //clear I2C FIFOs
+    HWREG(I2C0_BASE + I2C_O_FIFOCTL) = 80008000;
+
+    //
+    // Initialize the I2C master driver.
+    //
+    I2CMInit(&g_sI2CMSimpleInst, I2C0_BASE, INT_I2C0, 0xff, 0xff, SysCtlClockGet());
+}
+
+void
+InitSPI(void)
+{
     //*****************************************************************************
     // Configuración SPI
     //*****************************************************************************
@@ -138,59 +306,18 @@ main(void)
                    GPIO_PIN_2);
 
     SSIConfigSetExpClk(SSI0_BASE, SysCtlClockGet(), SSI_FRF_MOTO_MODE_0,
-                           SSI_MODE_MASTER, SPI_FREC, SPI_ANCHO);
+                       SSI_MODE_MASTER, SPI_FREC, SPI_ANCHO);
 
     SSIEnable(SSI0_BASE);
 
     while(SSIDataGetNonBlocking(SSI0_BASE, &pui32residual[0]))
-        {
+    {
+    }
+}
 
-        }
-    //*****************************************************************************
-    // Configuración Canales ADC
-    //*****************************************************************************
-
-    // The ADC0 peripheral must be enabled for use.
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_ADC0);
-
-    // For this example ADC0 is used with AIN0 and AIN1.
-    // The actual port and pins used may be different on your part, consult
-    // the data sheet for more information.  GPIO port E needs to be enabled
-    // so these pins can be used.
-    // TODO: change this to whichever GPIO port you are using.
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
-
-    // Select the analog ADC function for these pins.
-    // Consult the data sheet to see which functions are allocated per pin.
-    // TODO: change this to select the port/pin you are using.
-    GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_3);  // Configura el pin PE3
-    GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_2);  // Configura el pin PE2
-
-    // Se configura la secuencia 2, que permitiría hasta cuatro muestras (aunque
-    // se usarán dos).
-    ADCSequenceConfigure(ADC0_BASE, 2, ADC_TRIGGER_PROCESSOR, 0);
-
-    // Step 0 en la secuencia 2: Canal 0 (ADC_CTL_CH0) en modo single-ended (por defecto).
-    ADCSequenceStepConfigure(ADC0_BASE, 2, 0, ADC_CTL_CH0);
-
-    // Step 1 en la secuencia 2: Canal 1 (ADC_CTL_CH1) en modo single-ended (por defecto),
-    // y configura la bandera de interrupción (ADC_CTL_IE) para "setearse"
-    // cuando se tenga esta muestra. También se indica que esta es la última
-    // conversión en la secuencia 2 (ADC_CTL_END).
-    // Para más detalles del módulo ADC, consultar el datasheet.
-    ADCSequenceStepConfigure(ADC0_BASE, 2, 1, ADC_CTL_CH1 | ADC_CTL_IE | ADC_CTL_END);
-
-    // Since sample sequence 2 is now configured, it must be enabled.
-    ADCSequenceEnable(ADC0_BASE, 2);  // Notar el cambio de "secuencia".
-
-    // Clear the interrupt status flag.  This is done to make sure the
-    // interrupt flag is cleared before we sample.
-    ADCIntClear(ADC0_BASE, 2);  // Notar el cambio de "secuencia".
-
-    //*****************************************************************************
-    // Configuración Timer0
-    //*****************************************************************************
-
+void
+InitTimer0(void)
+{
     // Enable the peripherals used by this example.
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
 
@@ -214,16 +341,133 @@ main(void)
 
     // Enable the timers.
     TimerEnable(TIMER0_BASE, TIMER_A);
+}
 
-    //*****************************************************************************
-    // Configuración mpu6050
-    //*****************************************************************************
+//*****************************************************************************
+//!
+//! The function that is provided by this example as a callback when MPU6050
+//! transactions have completed.
+//!
+//*****************************************************************************
+void
+MPU6050Callback(void *pvCallbackData, uint_fast8_t ui8Status)
+{
+    //
+    // See if an error occurred.
+    //
+    if (ui8Status != I2CM_STATUS_SUCCESS)
+    {
+        //
+        // An error occurred, so handle it here if required.
+        //
+    }
+    //
+    // Indicate that the MPU6050 transaction has completed.
+    //
+    g_bMPU6050Done = true;
+}
+
+//*****************************************************************************
+//!
+//! The interrupt handler for the I2C module.
+//!
+//*****************************************************************************
+void
+I2C0IntHandler(void)
+{
+    //
+    // Call the I2C master driver interrupt handler.
+    //
+    I2CMIntHandler(&g_sI2CMSimpleInst);
+}
 
 
-    // Las conversiones se hacen al darse la interrupción del timer, para que
-    // el muestreo sea preciso. Luego de las configuraciones, el programa se
-    // queda en un ciclo infinito haciendo nada.
-    while(1)
+//*****************************************************************************
+//!
+//! MPU6050 function.
+//!
+//*****************************************************************************
+void
+MPU6050Call(void)
+{
+    float fAccel[3], fGyro[3];
+    tMPU6050 sMPU6050;
+
+    //
+    // Initialize the MPU6050. This code assumes that the I2C master instance
+    // has already been initialized.
+    //
+    g_bMPU6050Done = false;
+    MPU6050Init(&sMPU6050, &g_sI2CMSimpleInst, 0x68, MPU6050Callback, &sMPU6050);
+    while (!g_bMPU6050Done)
     {
     }
+
+    //
+    // Configure the MPU6050 for +/- 4 g accelerometer range.
+    //
+    g_bMPU6050Done = false;
+    MPU6050ReadModifyWrite(&sMPU6050, MPU6050_O_ACCEL_CONFIG, ~MPU6050_ACCEL_CONFIG_AFS_SEL_M,
+                           MPU6050_ACCEL_CONFIG_AFS_SEL_4G, MPU6050Callback, &sMPU6050);
+    while (!g_bMPU6050Done)
+    {
+    }
+
+    g_bMPU6050Done = false;
+    MPU6050ReadModifyWrite(&sMPU6050, MPU6050_O_PWR_MGMT_1, 0x00, 0b00000010 & MPU6050_PWR_MGMT_1_DEVICE_RESET, MPU6050Callback, &sMPU6050);
+    while (!g_bMPU6050Done)
+    {
+    }
+
+    g_bMPU6050Done = false;
+    MPU6050ReadModifyWrite(&sMPU6050, MPU6050_O_PWR_MGMT_2, 0x00, 0x00, MPU6050Callback, &sMPU6050);
+    while (!g_bMPU6050Done)
+    {
+    }
+
+
+    while (1)
+    {
+        //
+        // Request another reading from the MPU6050.
+        //
+        g_bMPU6050Done = false;
+        MPU6050DataRead(&sMPU6050, MPU6050Callback, &sMPU6050);
+        while (!g_bMPU6050Done)
+        {
+        }
+
+        //
+        // Get the new accelerometer and gyroscope readings.
+        //
+        MPU6050DataAccelGetFloat(&sMPU6050, &fAccel[0], &fAccel[1], &fAccel[2]);
+        MPU6050DataGyroGetFloat(&sMPU6050, &fGyro[0], &fGyro[1], &fGyro[2]);
+
+        //
+        // Do something with the new accelerometer and gyroscope readings.
+        //
+
+        //
+        // Roll and Pitch angles.
+        //
+        roll = (atan2(fAccel[0], sqrt (fAccel[1] * fAccel[1] + fAccel[2] * fAccel[2]))*180.0)/3.14;
+        pitch = (atan2(fAccel[1], sqrt (fAccel[0] * fAccel[0] + fAccel[2] * fAccel[2]))*180.0)/3.14;
+
+        UARTprintf("%d\n", (int) pitch);
+    }
+}
+
+//main program
+int main(void)
+ {
+    //
+    // Set System Clock
+    //
+    SysCtlClockSet(SYSCTL_SYSDIV_1 | SYSCTL_USE_PLL | SYSCTL_OSC_INT | SYSCTL_XTAL_16MHZ);
+
+    InitConsole();
+    InitSPI();
+    InitTimer0();
+    InitI2C0();
+    MPU6050Call();
 }
